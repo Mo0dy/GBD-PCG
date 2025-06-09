@@ -6,12 +6,14 @@
 #include "gpuassert.cuh"
 #include "utils.cuh"
 #include "glass.cuh"
-
+#include "settings.cuh"
 
 namespace cgrps = cooperative_groups;
 
 template <typename T>
 size_t pcgSharedMemSize(uint32_t state_size, uint32_t knot_points){
+    // Shared‑memory footprint is unchanged; wasting a few words when
+    // pre‑conditioning is disabled is cheaper than maintaining two formulas.
     return sizeof(T) * max(
                         (2*3*state_size*state_size + 
                         10 * state_size + 
@@ -54,13 +56,15 @@ bool checkPcgOccupancy(void* kernel, dim3 block, uint32_t state_size, uint32_t k
 template <typename T, uint32_t state_size, uint32_t knot_points>
 __global__
 void pcg(
-         T *d_S, 
-         T *d_Pinv, 
-         T *d_gamma,  				
-         T *d_lambda, 
-         T  *d_r, 
-         T  *d_p, 
-         T *d_v_temp, 
+         T *d_S,
+#if !ENABLE_PRECONDITIONING
+         T *d_Pinv,
+#endif
+         T *d_gamma,
+         T *d_lambda,
+         T *d_r,
+         T *d_p,
+         T *d_v_temp,
          T *d_eta_new_temp,
          uint32_t *d_iters, 
          bool *d_max_iter_exit,
@@ -106,7 +110,9 @@ void pcg(
         if(block_id == knot_points-1 && ind >= 2*states_sq){ continue; }
 
         s_S[ind] = d_S[block_id*states_sq*3 + ind];
-        s_Pinv[ind] = d_Pinv[block_id*states_sq*3 + ind];
+        #if ENABLE_PRECONDITIONING
+            s_Pinv[ind] = d_Pinv[block_id*states_sq*3 + ind];
+        #endif
     }
     glass::copy<T>(state_size, &d_gamma[block_x_statesize], s_gamma);
 
@@ -124,15 +130,20 @@ void pcg(
         s_r_b[ind] = s_gamma[ind] - s_r_b[ind];
         d_r[block_x_statesize + ind] = s_r_b[ind]; 
     }
-    
     grid.sync(); //-------------------------------------
 
-    // r_tilde = Pinv * r
-    loadbdVec<T, state_size, knot_points-1>(s_r, block_id, &d_r[block_x_statesize]);
-    __syncthreads();
-    bdmv<T>(s_r_tilde, s_Pinv, s_r, state_size, knot_points-1,  block_id);
-    __syncthreads();
-    
+    // r_tilde = M^{-1} r  (or r if no preconditioning)
+    #if ENABLE_PRECONDITIONING
+        loadbdVec<T, state_size, knot_points-1>(s_r, block_id, &d_r[block_x_statesize]);
+        __syncthreads();
+        bdmv<T>(s_r_tilde, s_Pinv, s_r, state_size, knot_points-1,  block_id);
+        __syncthreads();
+    #else
+        for (unsigned ind = thread_id; ind < state_size; ind += block_dim)
+            s_r_tilde[ind] = s_r_b[ind];
+        __syncthreads();
+    #endif
+
     // p = r_tilde
     for (unsigned ind = thread_id; ind < state_size; ind += block_dim){
         s_p_b[ind] = s_r_tilde[ind];
@@ -174,14 +185,19 @@ void pcg(
             s_r_b[ind] -= alpha * s_upsilon[ind];
             d_r[block_x_statesize + ind] = s_r_b[ind];
         }
-
         grid.sync(); //-------------------------------------
 
-        // r_tilde = Pinv * r
-        loadbdVec<T, state_size, knot_points-1>(s_r, block_id, &d_r[block_x_statesize]);
-        __syncthreads();
-        bdmv<T>(s_r_tilde, s_Pinv, s_r, state_size, knot_points-1, block_id);
-        __syncthreads();
+        // r_tilde = M^{-1} r   (or identity)
+        #if ENABLE_PRECONDITIONING
+            loadbdVec<T, state_size, knot_points-1>(s_r, block_id, &d_r[block_x_statesize]);
+            __syncthreads();
+            bdmv<T>(s_r_tilde, s_Pinv, s_r, state_size, knot_points-1, block_id);
+            __syncthreads();
+        #else
+            for (unsigned ind = thread_id; ind < state_size; ind += block_dim)
+                s_r_tilde[ind] = s_r_b[ind];
+            __syncthreads();
+        #endif
 
         // eta = r * r_tilde
         glass::dot<T, state_size>(s_eta_new_b, s_r_b, s_r_tilde);
