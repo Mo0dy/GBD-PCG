@@ -57,7 +57,7 @@ template <typename T, uint32_t state_size, uint32_t knot_points>
 __global__
 void pcg(
          T *d_S,
-#if !ENABLE_PRECONDITIONING
+#if ENABLE_PRECONDITIONING
          T *d_Pinv,
 #endif
          T *d_gamma,
